@@ -137,6 +137,12 @@ The output is always **1080x1920, 30 fps, H.264 + AAC 48 kHz stereo** — the ge
 
 ## Developer Guide
 
+> **Contributing or picking this up cold?** Read [`AGENTS.md`](AGENTS.md) first — it is the
+> project memory: architecture map, feature history, verification recipes, and the
+> non-obvious traps (ffmpeg filter-graph rules, the Windows build PATH/vcvars requirement,
+> why the UI can't be driven from a browser tab). AI agents in VS Code also load
+> [`.github/copilot-instructions.md`](.github/copilot-instructions.md) automatically.
+
 ### 1. Setup Environment Configuration
 Copy `.env.example` to `.env` in the root folder:
 ```bash
