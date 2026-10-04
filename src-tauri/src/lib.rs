@@ -1,6 +1,7 @@
 mod db;
 mod llm;
 mod media;
+mod mixer;
 mod models;
 mod transcription;
 
@@ -11,7 +12,7 @@ use tauri::{Emitter, Manager};
 
 use db::Database;
 use models::{
-    Candidate, EnvironmentStatus, MediaProbe, NormalizedTranscript, Project, ProjectDetail,
+    Candidate, ClipMix, EnvironmentStatus, MediaProbe, NormalizedTranscript, Project, ProjectDetail,
     Transcript, TranscriptWord,
 };
 
@@ -659,6 +660,156 @@ fn rename_project(
     state.db.rename_project(&project_id, &name).map_err(to_command_error)
 }
 
+// ---------------------------------------------------------------------------
+// Clip Mix: stitch a folder of clips into one finished vertical short
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MixProgressPayload {
+    mix_id: String,
+    message: String,
+    done: bool,
+}
+
+#[tauri::command]
+async fn scan_clip_folder(folder: String) -> Result<Vec<mixer::MediaEntry>, String> {
+    tokio::task::spawn_blocking(move || mixer::scan_clip_folder(&folder).map_err(to_command_error))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn scan_music_folder(folder: String) -> Result<Vec<mixer::MediaEntry>, String> {
+    tokio::task::spawn_blocking(move || {
+        mixer::scan_music_folder(&folder).map_err(to_command_error)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn create_clip_mix(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    source_dir: String,
+    options: mixer::MixOptions,
+) -> Result<ClipMix, String> {
+    let settings = serde_json::to_string(&options).map_err(|error| error.to_string())?;
+    state
+        .db
+        .create_clip_mix(
+            &name,
+            &source_dir,
+            options.music.as_deref(),
+            options.clips.len(),
+            &settings,
+        )
+        .map_err(to_command_error)
+}
+
+#[tauri::command]
+async fn render_clip_mix(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    mix_id: String,
+    options: mixer::MixOptions,
+) -> Result<ClipMix, String> {
+    let db = state.db.clone();
+    let data_dir = state.data_dir.clone();
+    let mix = db.get_clip_mix(&mix_id).map_err(to_command_error)?;
+
+    tokio::task::spawn_blocking(move || {
+        let output = mix_output_path(&mix)?;
+        let work_dir = data_dir.join("mixes").join(&mix.id).join("work");
+
+        db.update_clip_mix(&mix.id, "rendering", None, None)
+            .map_err(to_command_error)?;
+
+        let progress_app = app.clone();
+        let progress_mix_id = mix.id.clone();
+        let progress = move |message: &str| {
+            let _ = progress_app.emit(
+                "clip-mix-progress",
+                MixProgressPayload {
+                    mix_id: progress_mix_id.clone(),
+                    message: message.to_string(),
+                    done: false,
+                },
+            );
+        };
+
+        let finish = |message: String| {
+            let _ = app.emit(
+                "clip-mix-progress",
+                MixProgressPayload {
+                    mix_id: mix.id.clone(),
+                    message,
+                    done: true,
+                },
+            );
+        };
+
+        match mixer::render_mix_with_progress(&options, &work_dir, &output, progress) {
+            Ok(log) => {
+                let output_string = output.to_string_lossy().to_string();
+                db.update_clip_mix(&mix.id, "done", Some(&output_string), Some(&log.join("\n")))
+                    .map_err(to_command_error)?;
+                finish(format!("Saved {output_string}"));
+                db.get_clip_mix(&mix.id).map_err(to_command_error)
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let _ = db.update_clip_mix(&mix.id, "failed", None, Some(&message));
+                finish(message.clone());
+                Err(message)
+            }
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn list_clip_mixes(state: tauri::State<'_, AppState>) -> Result<Vec<ClipMix>, String> {
+    state.db.list_clip_mixes().map_err(to_command_error)
+}
+
+#[tauri::command]
+async fn delete_clip_mix(state: tauri::State<'_, AppState>, mix_id: String) -> Result<(), String> {
+    state.db.delete_clip_mix(&mix_id).map_err(to_command_error)
+}
+
+fn mix_slug(name: &str, fallback: &str) -> String {
+    let slug: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = slug.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn mix_output_path(mix: &ClipMix) -> Result<PathBuf, String> {
+    let documents_dir = dirs::document_dir()
+        .ok_or_else(|| "Could not find your Documents folder for the mix output.".to_string())?;
+    let slug = mix_slug(&mix.name, &mix.id);
+    Ok(documents_dir
+        .join("AutoShorts")
+        .join("Clip Mixes")
+        .join(&slug)
+        .join(format!("{slug}.mp4")))
+}
+
 pub fn run() {
     let _ = dotenvy::dotenv();
 
@@ -692,7 +843,13 @@ pub fn run() {
             delete_project,
             rename_project,
             check_youtube_copyright,
-            download_youtube_video
+            download_youtube_video,
+            scan_clip_folder,
+            scan_music_folder,
+            create_clip_mix,
+            render_clip_mix,
+            list_clip_mixes,
+            delete_clip_mix
         ])
         .run(tauri::generate_context!())
         .expect("error while running AutoShorts");

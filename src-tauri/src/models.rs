@@ -139,3 +139,20 @@ pub struct CandidateDraft {
     pub hook: String,
     pub rationale: String,
 }
+
+/// A "Clip Mix" job: stitch a folder of clips into one finished vertical short.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipMix {
+    pub id: String,
+    pub name: String,
+    pub source_dir: String,
+    pub music_path: Option<String>,
+    pub clip_count: i64,
+    pub status: String,
+    pub output_path: Option<String>,
+    pub settings_json: String,
+    pub render_log: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}

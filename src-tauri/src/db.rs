@@ -9,7 +9,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::models::{
-    Candidate, CandidateDraft, Clip, ClipCopy, Project, ProjectDetail, Transcript,
+    Candidate, CandidateDraft, Clip, ClipCopy, ClipMix, Project, ProjectDetail, Transcript,
 };
 
 #[derive(Clone)]
@@ -94,6 +94,20 @@ impl Database {
                 platform TEXT NOT NULL,
                 scheduled_for TEXT,
                 status TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS clip_mixes (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                source_dir TEXT NOT NULL,
+                music_path TEXT,
+                clip_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                output_path TEXT,
+                settings_json TEXT NOT NULL DEFAULT '{}',
+                render_log TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             ",
         )?;
@@ -442,6 +456,108 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn create_clip_mix(
+        &self,
+        name: &str,
+        source_dir: &str,
+        music_path: Option<&str>,
+        clip_count: usize,
+        settings_json: &str,
+    ) -> Result<ClipMix> {
+        let now = Utc::now().to_rfc3339();
+        let mix = ClipMix {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            source_dir: source_dir.to_string(),
+            music_path: music_path.map(|music| music.to_string()),
+            clip_count: clip_count as i64,
+            status: "pending".to_string(),
+            output_path: None,
+            settings_json: settings_json.to_string(),
+            render_log: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "INSERT INTO clip_mixes (id, name, source_dir, music_path, clip_count, status, output_path, settings_json, render_log, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                mix.id,
+                mix.name,
+                mix.source_dir,
+                mix.music_path,
+                mix.clip_count,
+                mix.status,
+                mix.output_path,
+                mix.settings_json,
+                mix.render_log,
+                mix.created_at,
+                mix.updated_at
+            ],
+        )?;
+        Ok(mix)
+    }
+
+    pub fn update_clip_mix(
+        &self,
+        mix_id: &str,
+        status: &str,
+        output_path: Option<&str>,
+        render_log: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "UPDATE clip_mixes
+             SET status = ?2,
+                 output_path = COALESCE(?3, output_path),
+                 render_log = COALESCE(?4, render_log),
+                 updated_at = ?5
+             WHERE id = ?1",
+            params![
+                mix_id,
+                status,
+                output_path,
+                render_log,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_clip_mix(&self, mix_id: &str) -> Result<ClipMix> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.query_row(
+            "SELECT id, name, source_dir, music_path, clip_count, status, output_path, settings_json, render_log, created_at, updated_at
+             FROM clip_mixes WHERE id = ?1",
+            params![mix_id],
+            clip_mix_from_row,
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("Clip mix not found: {mix_id}"))
+    }
+
+    pub fn list_clip_mixes(&self) -> Result<Vec<ClipMix>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT id, name, source_dir, music_path, clip_count, status, output_path, settings_json, render_log, created_at, updated_at
+             FROM clip_mixes ORDER BY created_at DESC",
+        )?;
+        let rows = statement.query_map([], clip_mix_from_row)?;
+        let mut mixes = Vec::new();
+        for row in rows {
+            mixes.push(row?);
+        }
+        Ok(mixes)
+    }
+
+    pub fn delete_clip_mix(&self, mix_id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute("DELETE FROM clip_mixes WHERE id = ?1", params![mix_id])?;
+        Ok(())
+    }
+
     pub fn delete_project(&self, project_id: &str) -> Result<()> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         conn.execute("DELETE FROM projects WHERE id = ?1", params![project_id])?;
@@ -457,6 +573,22 @@ impl Database {
         )?;
         Ok(())
     }
+}
+
+fn clip_mix_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipMix> {
+    Ok(ClipMix {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        source_dir: row.get(2)?,
+        music_path: row.get(3)?,
+        clip_count: row.get(4)?,
+        status: row.get(5)?,
+        output_path: row.get(6)?,
+        settings_json: row.get(7)?,
+        render_log: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
 }
 
 fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
@@ -487,3 +619,4 @@ fn candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Candidate> {
         selected: selected == 1,
     })
 }
+

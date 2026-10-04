@@ -24,6 +24,14 @@ import {
   Cloud,
   Youtube,
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
+  Clock,
+  FolderOpen,
+  Layers,
+  Music,
+  Trash2,
+  X,
 } from "lucide-react";
 import "./styles.css";
 
@@ -115,6 +123,49 @@ type BusyState =
   | "clipCount"
   | "cut";
 
+type MixMediaEntry = {
+  path: string;
+  fileName: string;
+  relativeDir: string | null;
+  durationSec: number | null;
+  width: number | null;
+  height: number | null;
+  hasVideo: boolean;
+  hasAudio: boolean;
+  sizeBytes: number;
+};
+
+type ClipMixRecord = {
+  id: string;
+  name: string;
+  sourceDir: string;
+  musicPath: string | null;
+  clipCount: number;
+  status: string;
+  outputPath: string | null;
+  settingsJson: string;
+  renderLog: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type MixOptions = {
+  clips: string[];
+  music: string | null;
+  musicVolume: number;
+  originalVolume: number;
+  keepOriginalAudio: boolean;
+  perClipSec: number | null;
+  maxTotalSec: number | null;
+  fit: "crop" | "blur";
+  transition: "cut" | "fade";
+  transitionSec: number;
+  targetW: number;
+  targetH: number;
+  fps: number;
+  loudnorm: boolean;
+};
+
 function App() {
   const [environment, setEnvironment] = useState<EnvironmentStatus | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -131,6 +182,7 @@ function App() {
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [youtubeStatus, setYoutubeStatus] = useState<"idle" | "checking" | "warning" | "downloading">("idle");
   const [youtubeWarningLicense, setYoutubeWarningLicense] = useState<string | null>(null);
+  const [showMixStudio, setShowMixStudio] = useState(false);
 
   // Persistence logic from localStorage
   const [isOnboarded, setIsOnboarded] = useState<boolean | null>(null);
@@ -546,6 +598,7 @@ function App() {
   }
 
   async function selectProject(projectId: string) {
+    setShowMixStudio(false);
     await run("idle", async () => {
       const nextDetail = await invoke<ProjectDetail>("get_project_detail", { projectId });
       setDetail(nextDetail);
@@ -680,7 +733,10 @@ function App() {
         <aside className="sidebar">
           <div
             className="brand-row"
-            onClick={() => setDetail(null)}
+            onClick={() => {
+              setDetail(null);
+              setShowMixStudio(false);
+            }}
             style={{ cursor: "pointer" }}
             title="Go to Home Dashboard"
           >
@@ -708,10 +764,27 @@ function App() {
             Import from YouTube
           </button>
 
+          <button
+            className="secondary-action"
+            onClick={() => {
+              setDetail(null);
+              setShowMixStudio(true);
+            }}
+            disabled={busy !== "idle"}
+            title="Stitch a folder of your own clips into one vertical short"
+            style={{ width: "100%", padding: "0.75rem", borderRadius: "10px", marginTop: "0.5rem", display: "flex", gap: "0.5rem", alignItems: "center", justifyContent: "center", border: "1px solid var(--border-color)", background: showMixStudio ? "var(--bg-panel)" : "transparent", color: "var(--text-primary)", cursor: "pointer", fontSize: "0.95rem" }}
+          >
+            <Layers size={18} />
+            Mix clips into a short
+          </button>
+
           <section className="project-list" aria-label="Projects">
             <button
-              className={`project-row ${!detail ? "active" : ""}`}
-              onClick={() => setDetail(null)}
+              className={`project-row ${!detail && !showMixStudio ? "active" : ""}`}
+              onClick={() => {
+                setDetail(null);
+                setShowMixStudio(false);
+              }}
             >
               <Clapperboard size={15} />
               <span>All Projects</span>
@@ -1076,6 +1149,8 @@ function App() {
                 </section>
               </div>
             </>
+          ) : showMixStudio ? (
+            <ClipMixStudio />
           ) : (
             <div className="home-dashboard">
               <header className="home-header">
@@ -1382,6 +1457,581 @@ function formatTime(seconds: number) {
   const minutes = Math.floor(seconds / 60);
   const remaining = Math.floor(seconds % 60);
   return `${minutes}:${remaining.toString().padStart(2, "0")}`;
+}
+
+function estimateMixDurations(
+  clips: MixMediaEntry[],
+  perClip: number | null,
+  maxTotal: number | null,
+) {
+  const planned: number[] = [];
+  let total = 0;
+  for (const clip of clips) {
+    let duration = Math.max(clip.durationSec ?? 0, 0.05);
+    if (perClip && perClip > 0) duration = Math.min(duration, perClip);
+    if (maxTotal && maxTotal > 0) {
+      if (total >= maxTotal) break;
+      duration = Math.min(duration, maxTotal - total);
+    }
+    if (duration < 0.05) break;
+    total += duration;
+    planned.push(duration);
+  }
+  return planned;
+}
+
+function ClipMixStudio() {
+  const [clipFolder, setClipFolder] = useState<string | null>(null);
+  const [available, setAvailable] = useState<MixMediaEntry[]>([]);
+  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+  const [musicFolder, setMusicFolder] = useState<string | null>(null);
+  const [tracks, setTracks] = useState<MixMediaEntry[]>([]);
+  const [music, setMusic] = useState("");
+
+  const [mixName, setMixName] = useState("");
+  const [fit, setFit] = useState<"crop" | "blur">("crop");
+  const [transition, setTransition] = useState<"cut" | "fade">("cut");
+  const [transitionSec, setTransitionSec] = useState(0.5);
+  const [musicVolume, setMusicVolume] = useState(0.35);
+  const [keepOriginalAudio, setKeepOriginalAudio] = useState(true);
+  const [perClipSec, setPerClipSec] = useState<number | null>(null);
+  const [maxTotalSec, setMaxTotalSec] = useState<number | null>(null);
+
+  const [history, setHistory] = useState<ClipMixRecord[]>([]);
+  const [progressLog, setProgressLog] = useState<string[]>([]);
+  const [scanning, setScanning] = useState(false);
+  const [rendering, setRendering] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<ClipMixRecord | null>(null);
+
+  useEffect(() => {
+    void loadHistory();
+    const pending = listen<{ mixId: string; message: string; done: boolean }>(
+      "clip-mix-progress",
+      (event) => {
+        setProgressLog((previous) => [...previous, event.payload.message]);
+      },
+    );
+    return () => {
+      void pending.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  async function loadHistory() {
+    try {
+      setHistory(await invoke<ClipMixRecord[]>("list_clip_mixes"));
+    } catch {
+      // History is a convenience view; a failure here must not block the studio.
+    }
+  }
+
+  const selectedClips = useMemo(
+    () =>
+      selectedPaths
+        .map((path) => available.find((entry) => entry.path === path))
+        .filter((entry): entry is MixMediaEntry => Boolean(entry)),
+    [selectedPaths, available],
+  );
+
+  const plannedDurations = useMemo(
+    () => estimateMixDurations(selectedClips, perClipSec, maxTotalSec),
+    [selectedClips, perClipSec, maxTotalSec],
+  );
+  const plannedTotal = plannedDurations.reduce((sum, value) => sum + value, 0);
+  const droppedCount = selectedClips.length - plannedDurations.length;
+
+  async function pickClipFolder() {
+    setError(null);
+    const folder = await open({ directory: true, multiple: false });
+    if (typeof folder !== "string") return;
+
+    setScanning(true);
+    try {
+      const found = await invoke<MixMediaEntry[]>("scan_clip_folder", { folder });
+      if (found.length === 0) {
+        setError("No video files found in that folder. Supported: mp4, mov, m4v, mkv, webm, avi.");
+        return;
+      }
+      setClipFolder(folder);
+      setAvailable(found);
+      setSelectedPaths(found.map((entry) => entry.path));
+      setMixName((previous) => previous || fileName(folder));
+      setResult(null);
+      setProgressLog([]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  async function pickMusicFolder() {
+    setError(null);
+    const folder = await open({ directory: true, multiple: false });
+    if (typeof folder !== "string") return;
+
+    setScanning(true);
+    try {
+      const found = await invoke<MixMediaEntry[]>("scan_music_folder", { folder });
+      if (found.length === 0) {
+        setError("No audio files found in that folder. Supported: mp3, wav, m4a, aac, flac, ogg, opus.");
+        return;
+      }
+      setMusicFolder(folder);
+      setTracks(found);
+      setMusic(found[0].path);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  function toggleClip(path: string) {
+    setSelectedPaths((previous) =>
+      previous.includes(path)
+        ? previous.filter((item) => item !== path)
+        : [...previous, path],
+    );
+  }
+
+  function moveClip(index: number, delta: number) {
+    setSelectedPaths((previous) => {
+      const target = index + delta;
+      if (target < 0 || target >= previous.length) return previous;
+      const next = [...previous];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  }
+
+  function applyPreset(total: number | null, perClip: number | null) {
+    setMaxTotalSec(total);
+    setPerClipSec(perClip);
+  }
+
+  async function generate() {
+    if (!clipFolder) {
+      setError("Pick the folder that holds your clips first.");
+      return;
+    }
+    if (selectedPaths.length === 0) {
+      setError("Select at least one clip.");
+      return;
+    }
+
+    setError(null);
+    setResult(null);
+    setProgressLog([]);
+    setRendering(true);
+
+    const options: MixOptions = {
+      clips: selectedPaths,
+      music: music || null,
+      musicVolume,
+      originalVolume: 1,
+      keepOriginalAudio,
+      perClipSec,
+      maxTotalSec,
+      fit,
+      transition,
+      transitionSec,
+      targetW: 1080,
+      targetH: 1920,
+      fps: 30,
+      loudnorm: true,
+    };
+
+    try {
+      const created = await invoke<ClipMixRecord>("create_clip_mix", {
+        name: mixName.trim() || fileName(clipFolder),
+        sourceDir: clipFolder,
+        options,
+      });
+      const finished = await invoke<ClipMixRecord>("render_clip_mix", {
+        mixId: created.id,
+        options,
+      });
+      setResult(finished);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRendering(false);
+      await loadHistory();
+    }
+  }
+
+  async function removeMix(mixId: string) {
+    try {
+      await invoke("delete_clip_mix", { mixId });
+      await loadHistory();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  const excluded = available.filter((entry) => !selectedPaths.includes(entry.path));
+
+  return (
+    <div className="mix-studio">
+      <header className="mix-header">
+        <div>
+          <div className="eyebrow">Clip Mix</div>
+          <h2>Turn a folder of clips into one short</h2>
+          <p>
+            Stitches your clips in order, reframes them to 1080x1920, adds your music and
+            normalises the loudness for Instagram and YouTube.
+          </p>
+        </div>
+      </header>
+
+      {error && (
+        <div className="mix-banner">
+          <AlertTriangle size={16} />
+          <span>{error}</span>
+          <button className="mix-icon-btn" onClick={() => setError(null)} title="Dismiss">
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
+      <section className="mix-card">
+        <div className="mix-card-head">
+          <span className="mix-step">1</span>
+          <div className="mix-card-title">
+            <h3>Your clips</h3>
+            <p>{clipFolder ?? "Choose the folder that holds your small clips."}</p>
+          </div>
+          <button className="mix-btn" onClick={() => void pickClipFolder()} disabled={scanning || rendering}>
+            {scanning ? <Loader2 className="spin" size={16} /> : <FolderOpen size={16} />}
+            {clipFolder ? "Change folder" : "Pick clips folder"}
+          </button>
+        </div>
+
+        {available.length > 0 && (
+          <>
+            <div className="mix-summary">
+              <span>
+                <strong>{selectedPaths.length}</strong> of {available.length} clips ·{" "}
+                <strong>{plannedTotal.toFixed(1)}s</strong> finished short
+              </span>
+              {plannedTotal > 90 && (
+                <span className="mix-warn">Instagram Reels and YouTube Shorts cap at 90s.</span>
+              )}
+              {droppedCount > 0 && (
+                <span className="mix-warn">
+                  {droppedCount} clip(s) will be dropped to hit the target length.
+                </span>
+              )}
+            </div>
+
+            <ul className="mix-clip-list">
+              {selectedPaths.map((path, index) => {
+                const entry = available.find((item) => item.path === path);
+                if (!entry) return null;
+                const planned = plannedDurations[index];
+                const source = entry.durationSec ?? 0;
+                return (
+                  <li key={path} className="mix-clip-row">
+                    <input
+                      type="checkbox"
+                      checked
+                      onChange={() => toggleClip(path)}
+                      title="Remove from the short"
+                    />
+                    <span className="mix-clip-order">{index + 1}</span>
+                    <span className="mix-clip-name" title={entry.path}>
+                      {entry.relativeDir ? `${entry.relativeDir}\\` : ""}
+                      {entry.fileName}
+                    </span>
+                    <span className="mix-clip-meta">
+                      {entry.width && entry.height ? `${entry.width}x${entry.height} · ` : ""}
+                      {planned === undefined
+                        ? "dropped"
+                        : planned >= source - 0.05
+                          ? `${source.toFixed(1)}s`
+                          : `${planned.toFixed(1)}s of ${source.toFixed(1)}s`}
+                      {!entry.hasAudio ? " · silent" : ""}
+                    </span>
+                    <button
+                      className="mix-icon-btn"
+                      onClick={() => moveClip(index, -1)}
+                      disabled={index === 0}
+                      title="Play earlier"
+                    >
+                      <ArrowUp size={14} />
+                    </button>
+                    <button
+                      className="mix-icon-btn"
+                      onClick={() => moveClip(index, 1)}
+                      disabled={index === selectedPaths.length - 1}
+                      title="Play later"
+                    >
+                      <ArrowDown size={14} />
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+
+            {excluded.length > 0 && (
+              <div className="mix-excluded">
+                <span>Not included:</span>
+                {excluded.map((entry) => (
+                  <button key={entry.path} className="mix-chip" onClick={() => toggleClip(entry.path)}>
+                    + {entry.fileName}
+                  </button>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {available.length === 0 && !scanning && (
+          <EmptyState icon={<Layers size={28} />} label="No clips loaded yet" />
+        )}
+      </section>
+
+      <section className="mix-card">
+        <div className="mix-card-head">
+          <span className="mix-step">2</span>
+          <div className="mix-card-title">
+            <h3>Music</h3>
+            <p>
+              {musicFolder ??
+                "Point at a folder of your own tracks or royalty-free music."}
+            </p>
+          </div>
+          <button className="mix-btn" onClick={() => void pickMusicFolder()} disabled={scanning || rendering}>
+            {scanning ? <Loader2 className="spin" size={16} /> : <Music size={16} />}
+            {musicFolder ? "Change folder" : "Pick music folder"}
+          </button>
+        </div>
+
+        {tracks.length > 0 ? (
+          <>
+            <div className="mix-controls">
+              <label>
+                <span>Track</span>
+                <select value={music} onChange={(event) => setMusic(event.target.value)}>
+                  <option value="">No music</option>
+                  {tracks.map((track) => (
+                    <option key={track.path} value={track.path}>
+                      {track.fileName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Music volume · {Math.round(musicVolume * 100)}%</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={musicVolume}
+                  onChange={(event) => setMusicVolume(Number(event.target.value))}
+                />
+              </label>
+              <label className="mix-check">
+                <input
+                  type="checkbox"
+                  checked={keepOriginalAudio}
+                  onChange={(event) => setKeepOriginalAudio(event.target.checked)}
+                />
+                <span>Keep the sound from my clips underneath</span>
+              </label>
+            </div>
+            {!music && !keepOriginalAudio && (
+              <p className="mix-warn">
+                Nothing provides sound right now, so the short would be silent. Pick a track or
+                keep the sound from your clips.
+              </p>
+            )}
+            {!music && keepOriginalAudio && (
+              <p className="mix-note">
+                No track selected — your clips' own audio is kept and normalised to -14 LUFS.
+                Music you pick here is faded in over 1.2s and out over 1.5s. Use music you own or
+                that is licensed for reuse; AutoShorts will not download copyrighted audio.
+              </p>
+            )}
+          </>
+        ) : (
+          <p className="mix-note">
+            The track is faded in over 1.2s and out over 1.5s, then the whole mix is normalised
+            to -14 LUFS, the loudness target both platforms expect. Use music you own or that is
+            licensed for reuse — AutoShorts will not download copyrighted audio.
+          </p>
+        )}
+      </section>
+
+      <section className="mix-card">
+        <div className="mix-card-head">
+          <span className="mix-step">3</span>
+          <div className="mix-card-title">
+            <h3>Look &amp; length</h3>
+            <p>Output is always 1080x1920, 30 fps, H.264 + AAC.</p>
+          </div>
+        </div>
+
+        <div className="mix-controls">
+          <label>
+            <span>Framing</span>
+            <select value={fit} onChange={(event) => setFit(event.target.value as "crop" | "blur")}>
+              <option value="crop">Fill the screen (crop to 9:16)</option>
+              <option value="blur">Fit whole frame on a blurred background</option>
+            </select>
+          </label>
+          <label>
+            <span>Between clips</span>
+            <select
+              value={transition}
+              onChange={(event) => setTransition(event.target.value as "cut" | "fade")}
+            >
+              <option value="cut">Hard cut</option>
+              <option value="fade">Crossfade</option>
+            </select>
+          </label>
+          {transition === "fade" && (
+            <label>
+              <span>Crossfade · {transitionSec.toFixed(1)}s</span>
+              <input
+                type="range"
+                min={0.2}
+                max={1.5}
+                step={0.1}
+                value={transitionSec}
+                onChange={(event) => setTransitionSec(Number(event.target.value))}
+              />
+            </label>
+          )}
+          <label>
+            <span>Max seconds per clip</span>
+            <input
+              type="number"
+              min={0.5}
+              step={0.5}
+              value={perClipSec ?? ""}
+              placeholder="whole clip"
+              onChange={(event) =>
+                setPerClipSec(event.target.value === "" ? null : Number(event.target.value))
+              }
+            />
+          </label>
+          <label>
+            <span>Target total length (s)</span>
+            <input
+              type="number"
+              min={5}
+              step={5}
+              value={maxTotalSec ?? ""}
+              placeholder="no limit"
+              onChange={(event) =>
+                setMaxTotalSec(event.target.value === "" ? null : Number(event.target.value))
+              }
+            />
+          </label>
+        </div>
+
+        <div className="mix-presets">
+          <button className="mix-chip" onClick={() => applyPreset(30, 3)}>
+            30s reel · 3s per clip
+          </button>
+          <button className="mix-chip" onClick={() => applyPreset(60, 4)}>
+            60s reel · 4s per clip
+          </button>
+          <button className="mix-chip" onClick={() => applyPreset(90, 5)}>
+            90s max · 5s per clip
+          </button>
+          <button className="mix-chip" onClick={() => applyPreset(null, null)}>
+            Every clip in full
+          </button>
+        </div>
+      </section>
+
+      <section className="mix-card">
+        <div className="mix-card-head">
+          <span className="mix-step">4</span>
+          <div className="mix-card-title">
+            <h3>Name &amp; render</h3>
+            <p>Saved to Documents\AutoShorts\Clip Mixes.</p>
+          </div>
+        </div>
+
+        <div className="mix-controls">
+          <label className="mix-wide">
+            <span>Short name</span>
+            <input
+              value={mixName}
+              onChange={(event) => setMixName(event.target.value)}
+              placeholder="My reel"
+              disabled={rendering}
+            />
+          </label>
+        </div>
+
+        <button
+          className="primary-action mix-render"
+          onClick={() => void generate()}
+          disabled={rendering || scanning || selectedPaths.length === 0}
+        >
+          {rendering ? <Loader2 className="spin" size={18} /> : <Wand2 size={18} />}
+          {rendering ? "Building your short..." : "Build my short"}
+        </button>
+
+        {progressLog.length > 0 && (
+          <ul className="mix-progress">
+            {progressLog.map((line, index) => (
+              <li key={`${index}-${line}`}>{line}</li>
+            ))}
+          </ul>
+        )}
+
+        {result?.outputPath && (
+          <div className="mix-result">
+            <BadgeCheck size={16} />
+            <div>
+              <strong>Short ready to upload</strong>
+              <div className="output-path">{result.outputPath}</div>
+            </div>
+          </div>
+        )}
+      </section>
+
+      {history.length > 0 && (
+        <section className="mix-card">
+          <div className="mix-card-head">
+            <span className="mix-step">
+              <Clock size={14} />
+            </span>
+            <div className="mix-card-title">
+              <h3>Recent mixes</h3>
+              <p>{history.length} saved on this machine</p>
+            </div>
+          </div>
+          <ul className="mix-history">
+            {history.map((mix) => (
+              <li key={mix.id}>
+                <span className={`mix-status ${mix.status}`}>{mix.status}</span>
+                <span className="mix-clip-name">{mix.name}</span>
+                <span className="mix-clip-meta">
+                  {mix.clipCount} clip(s) · {new Date(mix.createdAt).toLocaleString()}
+                </span>
+                {mix.outputPath && <span className="output-path">{mix.outputPath}</span>}
+                <button
+                  className="mix-icon-btn"
+                  onClick={() => void removeMix(mix.id)}
+                  title="Remove from history"
+                >
+                  <Trash2 size={14} />
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+    </div>
+  );
 }
 
 interface OnboardingProps {
